@@ -49,6 +49,7 @@ CHIAKI_EXPORT void chiaki_video_receiver_init(ChiakiVideoReceiver *video_receive
 	video_receiver->packet_stats = packet_stats;
 
 	video_receiver->frames_lost = 0;
+	video_receiver->consecutive_failures = 0;
 	video_receiver->frames_lost_total = 0;
 	memset(video_receiver->reference_frames, -1, sizeof(video_receiver->reference_frames));
 	chiaki_bitstream_init(&video_receiver->bitstream, video_receiver->log, video_receiver->session->connect_info.video_profile.codec);
@@ -161,10 +162,16 @@ CHIAKI_EXPORT void chiaki_video_receiver_av_packet(ChiakiVideoReceiver *video_re
 		if(chiaki_seq_num_16_gt(frame_index, next_frame_expected)
 			&& !(frame_index == 1 && video_receiver->frame_index_cur < 0)) // ok for frame 1
 		{
-			CHIAKI_LOGW(video_receiver->log, "Detected missing or corrupt frame(s) from %d to %d", next_frame_expected, (int)frame_index);
-			err = stream_connection_send_corrupt_frame(&video_receiver->session->stream_connection, next_frame_expected, frame_index - 1);
-			if(err != CHIAKI_ERR_SUCCESS)
-				CHIAKI_LOGW(video_receiver->log, "Error sending corrupt frame.");
+			// Only send corrupt reports if we're NOT already waiting for IDR.
+			// When in IDR recovery, the PS5 already knows we need a keyframe —
+			// spamming corrupt reports just adds overhead and log noise.
+			if(!chiaki_video_receiver_get_waiting_for_idr(video_receiver))
+			{
+				CHIAKI_LOGW(video_receiver->log, "Detected missing or corrupt frame(s) from %d to %d", next_frame_expected, (int)frame_index);
+				err = stream_connection_send_corrupt_frame(&video_receiver->session->stream_connection, next_frame_expected, frame_index - 1);
+				if(err != CHIAKI_ERR_SUCCESS)
+					CHIAKI_LOGW(video_receiver->log, "Error sending corrupt frame.");
+			}
 		}
 
 		video_receiver->frame_index_cur = frame_index;
@@ -251,12 +258,31 @@ static ChiakiErrorCode chiaki_video_receiver_flush_frame(ChiakiVideoReceiver *vi
 			if(slice.slice_type == CHIAKI_BITSTREAM_SLICE_I)
 			{
 				chiaki_video_receiver_set_waiting_for_idr(video_receiver, false);
-				CHIAKI_LOGI(video_receiver->log, "Received IDR frame, resuming decode");
+				// CRITICAL: Reset frames_lost so the callback doesn't reject
+				// this IDR due to accumulated losses from skipped P-frames.
+				// Without this, the callback sees frames_lost > 0, returns false,
+				// and re-triggers waiting_for_idr — creating an infinite loop.
+				video_receiver->frames_lost = 0;
+				CHIAKI_LOGI(video_receiver->log, "Received IDR frame, resuming decode (frames_lost reset)");
 			}
 			else
 			{
 				CHIAKI_LOGV(video_receiver->log, "Skipping P-frame %d while waiting for IDR", (int)video_receiver->frame_index_cur);
 				video_receiver->frame_index_prev = video_receiver->frame_index_cur;
+				// Advance prev_complete to stop the ever-growing corrupt range.
+				// Without this, every frame reports corrupt from the original
+				// loss point (e.g. 59630) to current, flooding the PS5.
+				video_receiver->frame_index_prev_complete = video_receiver->frame_index_cur;
+				video_receiver->consecutive_failures++;
+				if(video_receiver->consecutive_failures >= 5)
+				{
+					CHIAKI_LOGW(video_receiver->log, "Auto-recovery: %d P-frames skipped waiting for IDR, re-requesting",
+						video_receiver->consecutive_failures);
+					video_receiver->consecutive_failures = 0;
+					video_receiver->frames_lost = 0;
+					memset(video_receiver->reference_frames, -1, sizeof(video_receiver->reference_frames));
+					stream_connection_send_idr_request(&video_receiver->session->stream_connection);
+				}
 				return CHIAKI_ERR_SUCCESS;
 			}
 		}
@@ -287,6 +313,13 @@ static ChiakiErrorCode chiaki_video_receiver_flush_frame(ChiakiVideoReceiver *vi
 					video_receiver->frames_lost_total++;
 					chiaki_mutex_unlock(&video_receiver->frames_lost_mutex);
 					CHIAKI_LOGW(video_receiver->log, "Missing reference frame %d for decoding frame %d", (int)ref_frame_index, (int)video_receiver->frame_index_cur);
+					// Auto-recovery: request IDR and advance prev_complete to break cascade
+					if(!chiaki_video_receiver_get_waiting_for_idr(video_receiver))
+					{
+						stream_connection_send_idr_request(&video_receiver->session->stream_connection);
+						chiaki_video_receiver_set_waiting_for_idr(video_receiver, true);
+						CHIAKI_LOGI(video_receiver->log, "Auto-recovery: Missing ref frame, requesting IDR");
+					}
 				}
 			}
 		}
@@ -302,6 +335,13 @@ static ChiakiErrorCode chiaki_video_receiver_flush_frame(ChiakiVideoReceiver *vi
 		{
 			succ = false;
 			CHIAKI_LOGW(video_receiver->log, "Video callback did not process frame successfully.");
+			// Auto-recovery: callback failure also needs IDR to recover
+			if(!chiaki_video_receiver_get_waiting_for_idr(video_receiver))
+			{
+				stream_connection_send_idr_request(&video_receiver->session->stream_connection);
+				chiaki_video_receiver_set_waiting_for_idr(video_receiver, true);
+				CHIAKI_LOGI(video_receiver->log, "Auto-recovery: Callback failed, requesting IDR");
+			}
 		}
 		else
 		{
@@ -313,7 +353,35 @@ static ChiakiErrorCode chiaki_video_receiver_flush_frame(ChiakiVideoReceiver *vi
 	video_receiver->frame_index_prev = video_receiver->frame_index_cur;
 
 	if(succ)
+	{
 		video_receiver->frame_index_prev_complete = video_receiver->frame_index_cur;
+		video_receiver->consecutive_failures = 0;
+	}
+	else
+	{
+		video_receiver->consecutive_failures++;
+		// CRITICAL: After 5 consecutive failures, force-advance prev_complete
+		// to break the ever-growing corrupt frame range cascade.
+		// Without this, every frame reports corrupt from the original lost frame
+		// to the current frame, flooding the PS5 with corrupt reports and never recovering.
+		if(video_receiver->consecutive_failures >= 5)
+		{
+			CHIAKI_LOGW(video_receiver->log, "Auto-recovery: %d consecutive failures, advancing prev_complete from %d to %d and clearing ref frames",
+				video_receiver->consecutive_failures,
+				(int)video_receiver->frame_index_prev_complete,
+				(int)video_receiver->frame_index_cur);
+			video_receiver->frame_index_prev_complete = video_receiver->frame_index_cur;
+			video_receiver->consecutive_failures = 0;
+			video_receiver->frames_lost = 0;
+			// Wipe stale reference frames so next IDR starts clean
+			memset(video_receiver->reference_frames, -1, sizeof(video_receiver->reference_frames));
+			if(!chiaki_video_receiver_get_waiting_for_idr(video_receiver))
+			{
+				stream_connection_send_idr_request(&video_receiver->session->stream_connection);
+				chiaki_video_receiver_set_waiting_for_idr(video_receiver, true);
+			}
+		}
+	}
 
 	return CHIAKI_ERR_SUCCESS;
 }

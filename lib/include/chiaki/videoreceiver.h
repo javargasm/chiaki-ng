@@ -32,6 +32,7 @@ typedef struct chiaki_video_receiver_t
 	ChiakiPacketStats *packet_stats;
 
 	int32_t frames_lost;
+	int32_t consecutive_failures; // Auto-recovery: counts consecutive decode failures to break cascade loops
 	int32_t frames_lost_total;
 	int32_t reference_frames[16];
 	ChiakiBitstream bitstream;

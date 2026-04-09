@@ -3274,9 +3274,10 @@ static ChiakiErrorCode http_send_session_message(Session *session, SessionMessag
         short_message_serialize(session, message, &payload_str, &payload_len);
     else
         session_message_serialize(session, message, &payload_str, &payload_len);
-    char msg_buf[sizeof(session_message_envelope_fmt) * 2 + payload_len];
+    size_t msg_buf_size = sizeof(session_message_envelope_fmt) * 2 + payload_len;
+    CHIAKI_VLA(char, msg_buf, msg_buf_size);
     snprintf(
-        msg_buf, sizeof(msg_buf), session_message_envelope_fmt,
+        msg_buf, msg_buf_size, session_message_envelope_fmt,
         payload_str, session->account_id, console_uid_str,
         session->console_type == CHIAKI_HOLEPUNCH_CONSOLE_TYPE_PS4 ? "PS4" : "PS5"
     );
@@ -3822,11 +3823,11 @@ static ChiakiErrorCode check_candidates(
 
     size_t extra_addresses_used = 0;
     // Set up addresses for each candidate + extras (use sockaddr_storage and cast bc needs to be at least that big if we get ipv6)
-    struct sockaddr_storage addrs[num_candidates + EXTRA_CANDIDATE_ADDRESSES];
-    socklen_t lens[num_candidates + EXTRA_CANDIDATE_ADDRESSES];
-    Candidate candidates[num_candidates + EXTRA_CANDIDATE_ADDRESSES];
+    CHIAKI_VLA(struct sockaddr_storage, addrs, num_candidates + EXTRA_CANDIDATE_ADDRESSES);
+    CHIAKI_VLA(socklen_t, lens, num_candidates + EXTRA_CANDIDATE_ADDRESSES);
+    CHIAKI_VLA(Candidate, candidates, num_candidates + EXTRA_CANDIDATE_ADDRESSES);
     memcpy(candidates, candidates_received, num_candidates * sizeof(Candidate));
-    int responses_received[num_candidates + EXTRA_CANDIDATE_ADDRESSES];
+    CHIAKI_VLA(int, responses_received, num_candidates + EXTRA_CANDIDATE_ADDRESSES);
 #ifdef __SWITCH__
     // Use poll() on Switch — select() fails when FD numbers >= FD_SETSIZE (256)
     struct pollfd *pollfds = NULL;
@@ -4966,8 +4967,14 @@ static json_object* session_message_get_payload(ChiakiLog *log, json_object *ses
         // Insert empty object as key for localPeerAddr key
         size_t prefix_len = peeraddr_end - json;
         size_t suffix_len = strlen(peeraddr_end);
-        char fixed_json[strlen(json) + 3]; // {} + \0
-        memset(fixed_json, 0, sizeof(fixed_json));
+        size_t fixed_json_size = strlen(json) + 3; // {} + \0
+        char *fixed_json = malloc(fixed_json_size);
+        if(!fixed_json)
+        {
+            CHIAKI_LOGE(log, "HOLEPUNCH - Failed to allocate memory for fixed JSON");
+            return NULL;
+        }
+        memset(fixed_json, 0, fixed_json_size);
         strncpy(fixed_json, json, prefix_len);
         fixed_json[prefix_len] = '{';
         fixed_json[prefix_len + 1] = '}';
@@ -4979,6 +4986,7 @@ static json_object* session_message_get_payload(ChiakiLog *log, json_object *ses
             CHIAKI_LOGE(log, "Couldn't parse the following fixed json: %s", fixed_json);
             CHIAKI_LOGE(log, json_object_to_json_string_ext(payload_json, JSON_C_TO_STRING_PRETTY));
         }
+        free(fixed_json);
     }
         // check if parse fails
         if(message_json == NULL)

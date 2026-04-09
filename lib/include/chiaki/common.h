@@ -27,7 +27,22 @@ typedef uint16_t chiaki_unaligned_uint16_t;
 typedef int16_t chiaki_unaligned_int16_t;
 #endif
 
-#define CHIAKI_EXPORT
+#ifdef _WIN32
+#  ifdef chiaki_lib_EXPORTS
+#    define CHIAKI_EXPORT __declspec(dllexport)
+#  else
+#    define CHIAKI_EXPORT __declspec(dllimport)
+#  endif
+#else
+#  define CHIAKI_EXPORT
+#endif
+
+#ifdef _MSC_VER
+#include <malloc.h>
+#define CHIAKI_VLA(type, name, size) type* name = (type*)_alloca((size) * sizeof(type))
+#else
+#define CHIAKI_VLA(type, name, size) type name[size]
+#endif
 
 #ifdef _WIN32
 #define CHIAKI_SSIZET_TYPE int
